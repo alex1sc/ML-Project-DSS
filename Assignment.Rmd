@@ -1,0 +1,412 @@
+---
+title: "Quantified Self Exercise Activity ML Prediction"
+author: "Alex Schmitt - `r Sys.Date()`"
+output: html_document
+---
+
+
+```{r setup, echo=FALSE, include=TRUE}
+knitr::opts_chunk$set(
+	fig.height = 5,
+	fig.width = 10,
+	cache = FALSE,
+	echo=FALSE,
+	include=TRUE,
+	errors = FALSE,
+	warnings = FALSE
+)
+options( width = 80)
+```
+
+# Synopsis
+This is the Machine Learning Project of Data Science Specialization. It is about predicting how well subjects realized a series of barbell lift exercises, recorded by different kind of bodily sensors (Quantified Self Paradigm).  [Full information can be found there.](http://groupware.les.inf.puc-rio.br/har)
+
+The goal of this project is to predict what are the classes of the 20 observations in the test data set, using different Machine Learning algorithms. We are using 2 algorithms GBM (Generalized Boosted Model) and RF (Random Forest) with only acceleration sensors features at first. We compare their results to choose the best one. Since the best one doesn't give us a total satisfaction, we then enlarge our search to other features. In a third attempt we reduce the number of features and still have a 100 % prediction result. 
+
+```{r, message=FALSE, warning=FALSE}
+library( ggplot2)
+library( gridExtra)
+library( dplyr)
+library( caret)
+library( gbm)
+library( randomForest)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library( parallel)
+library( doParallel)
+
+cluster <- makeCluster( detectCores() - 1) # conv. leave 1 core for OS
+registerDoParallel( cluster)
+
+# // train control for models
+trC <- trainControl( method = "cv", 
+                     number = 10,
+                     allowParallel = TRUE)
+```
+
+
+```{r}
+# credits to http://www.colourlovers.com/lover/thesapphirerose
+colours <- c( "#F65C6F", "#FC9B76", "#A24C85", "#5DA1AC",
+              "#AFC89C", "#F65C6F", "#FC9B76", "#A24C85") 
+cols <- c( "#F65C6F", "#5DA1AC") # Red, Blue
+```
+
+
+```{r}
+set.seed( 434653)
+
+## some constants
+HTTPtesting  = 
+  "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+HTTPtraining = 
+  "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+FILEtesting   = "pml-testing.csv"
+FILEtraining  = "pml-training.csv"
+FILEmodelGBM  = "modelGBM.rda"
+FILEmodelRF   = "modelRF.rda"    
+FILEmodelRF2  = "modelRF2.rda"    
+FILEmodelRF3  = "modelRF3.rda"
+FILEstimeRF2  = "stimeRF2.rda"
+FILEstimeRF3  = "stimeFR3.rda"
+```
+
+```{r}
+# uncomment if needed
+# download.file( url = HTTPtraining, destfile = FILEtraining)
+# download.file( url = HTTPtesting, destfile =  FILEtesting)
+
+training <- read.csv( FILEtraining)
+testing  <- read.csv( FILEtesting)
+```
+
+```{r}
+training$classe    <- factor( training$classe)
+testing$problem_id <- factor( testing$problem_id)
+```
+
+# Data exploration
+
+First of all let's check the distribution of observation regarding subjects and classes :
+
+```{r, fig.cap="Fig.1 : Comparison between distributions of Subjects and Classes"}
+
+p1 <- qplot( training$user_name, geom = "blank") + 
+  geom_bar(fill = "#5DA1AC", alpha = .5) + theme_bw() +
+  coord_cartesian( ylim = c(0, 6000)) + 
+  labs( x = "Subjects", y = "Number of observations")
+
+p2 <- qplot( training$classe, geom = "blank") + 
+  geom_bar(fill = "#F65C6F", alpha = .5) + theme_bw() +
+  coord_cartesian( ylim = c(0, 6000)) + 
+  labs( x = "Classes", y = "Number of observations")
+
+grid.arrange( p1, p2, nrow = 1, ncol = 2)
+```
+
+Observations are almost equally distributed between the different subjects and classes of exercise. The quality of the models should not be impacted by these factors. 
+
+As specified by the subject of this project : "... use data from accelerometers on the belt, forearm, arm, and dumbell ...", we use the only features related to the accelerometers. Within these remaining features we also discard the ones who have mostly NAs values.
+
+```{r, echo=FALSE}
+cols <- names( training)
+cols2 <- cols[ grepl( pattern = "accel", x = cols)]
+training2 <- training[ , c( cols2, "classe")]
+testing2  <- testing[  , c( cols2, "problem_id")]
+```
+
+```{r, include=FALSE}
+mf <- function( x){ sum( complete.cases( x))}
+sort( unlist( lapply( training2, mf)))
+```
+
+Below are the remaining features for our models :
+
+```{r, echo=FALSE}
+cols3 <- setdiff( cols2, 
+                  cols[ grepl( pattern = "var_(total_)?accel", 
+                               x = cols)])
+training3 <- training2[ , c( cols3, "classe")]
+testing3  <- testing2[ ,  c( cols3, "problem_id")]
+
+# And because all cols are about acceleration we drop "accel_"
+names( training3) <- sub( "accel_", "", names( training3))
+names( testing3)  <- sub( "accel_", "", names( testing3))
+names( training3)
+```
+
+# Models
+
+We use the training data set for training and validation of different models in the ratio of 80/20. We will train and validate two different models (GBM and RF), and then use the 20 cases testing data set to test the best model and predict the classes of the problem IDs (test$problem_id). 
+
+Also we are using 10-folds cross validation during the training, to lower the bias and improving the variance of training our model. 
+
+```{r}
+inTrain <- createDataPartition( training3$classe, p = .8)[[ 1]]
+train <- training3[  inTrain, ]
+valid <- training3[ -inTrain, ]
+test  <- testing3
+```
+
+### Gradient Boosting Method (GBM) model
+
+Below is the description of our trained GBM model, the resulting Confusion Matrix and Accuracy resulting :
+```{r}
+if( file.exists( FILEmodelGBM)){
+  load( FILEmodelGBM) 
+} else { 
+  modelGBM <- train( classe ~ .,
+                     method = "gbm",
+                     data = train,
+                     trControl = trC)
+  save( modelGBM, file = FILEmodelGBM)}
+
+```
+
+```{r, echo=FALSE}
+modelGBM
+# modelXGB$resample
+confusionMatrix.train( modelGBM) 
+```
+
+### GBM Prediction
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+predGBM <- predict( modelGBM, valid)
+AccGBM  <- postResample( predGBM, valid$classe)
+AccGBM[ 1]
+```
+
+On the remaining 20% of the validation data set, the accuracy of our model is `r round( AccGBM[ 1], 2)`, which is not so good. Let see if Random Forest model is better.
+
+### Random Forest (RF) model
+
+```{r}
+if( file.exists( FILEmodelRF)){
+  load( FILEmodelRF) 
+} else { 
+  modelRF <- train( classe ~ ., 
+                    method = "rf",  
+                    data = train, 
+                    trControl = trC)
+  save( modelRF, file = FILEmodelRF)}
+
+modelRF
+confusionMatrix( modelRF) 
+importance <- varImp( modelRF, scale = FALSE)
+```
+
+### RF Prediction
+
+```{r}
+predRF <- predict( modelRF, valid)
+AccRF  <- postResample( predRF, valid$classe)
+AccRF[ 1]
+```
+
+On the remaining 20% of the validation data set, the accuracy of our model is `r round( AccRF[ 1], 2)`, which is better than our first model (`r round( AccGBM[ 1], 2)`). It is not 100% accurate though.
+
+# Testing the best model (RF)
+
+The expected out-of-sample error for the RF model is equal to (1 - Accuracy) times the number of sample to test on it => `r ( 1 - round( AccRF[ 1], 2)) * 20` (it is `r ( 1 - round( AccGBM[ 1], 2)) * 20` for the GBM model). Below is the result of our predictive model on the 20 observation test set. 
+
+```{r}
+test$result <- predict( modelRF, test) ; test$result
+```
+
+When we check our result on the solution there is 2 wrong values : which is more than the expected value. Although 20 observations is really a small data set to test with. Having 2 errors, expecting 1 (alsmost) is not so bad with a so small test data set. 
+
+Below are the features used by the two models to predict the results. The difference certainly explain why one model is more accurate than the other.
+
+```{r, fig.cap="Fig.2 : Rank of features by importance - comparison between the two models : GBM (left) and RF (right)."}
+p1 <- plot( varImp( modelGBM))
+p2 <- plot( varImp( modelRF))
+grid.arrange( p1, p2, nrow = 1, ncol = 2)
+```
+    
+While an accuracy of `r round( AccRF[ 1], 2)` is not bad, let's find out if we can do better. So we try to include other features in the model to have more accuracy. We only substract columns with lot of NAs or non significant values ("").
+
+### Random Forest RF model (2nd attempt)
+
+```{r}
+mf <- function( x){ sum( complete.cases( x))}
+cols <- sort( unlist( lapply( training, mf)))
+cols <- cols[ cols == nrow( training)]
+cols <- names( cols)
+cols <- cols[ -c( grep( pattern = "^skewness_|^kurtosis_|^max_yaw_|^min_yaw_|^amplitude_|X|user_name|timestamp|window$", cols))]
+
+newtrain <- training[ , cols]
+cols <- cols[ - length( names( newtrain))] ; cols <- c( cols, "problem_id")
+newtest  <- testing[  , cols]
+```
+
+```{r}
+inTrain <- createDataPartition( newtrain$classe, p = .8)[[ 1]]
+newtrain <- newtrain[  inTrain, ]
+newvalid <- newtrain[ -inTrain, ]
+newtest  <- newtest
+```
+
+```{r}
+if( file.exists( FILEmodelRF2)){
+  load( FILEmodelRF2) 
+} else { 
+  stimeRF2 <- system.time(
+    modelRF2 <- train( classe ~ ., 
+                       method = "rf",  
+                       data = newtrain, 
+                       trControl = trC))
+  save( stimeRF2, file = FILEstimeRF2)
+  save( modelRF2, file = FILEmodelRF2)
+  }
+
+modelRF2
+confusionMatrix( modelRF2) 
+importance2 <- varImp( modelRF2)
+```
+
+### Random Forest Prediction (2nd)
+
+```{r}
+predRF2 <- predict( modelRF2, newvalid)
+AccRF2  <- postResample( predRF2, newvalid$classe)
+AccRF2[ 1]
+```
+
+Here we can see that having taking much more features, we have improved our model to get 100% accuracy ( Accuracy = `r AccRF2[ 1]`).
+
+Below we can see that the optimal number of feature is 27. 
+
+```{r, fig.cap="Fig.3 : Optimum number of features."}
+plot( modelRF2)
+```
+
+### Testing the 2nd round of RF
+
+The expected out-of-sample error is nul. Let's check if the prediction realized itself. 
+
+```{r}
+newtest$result <- predict( modelRF2, newtest) ; newtest$result
+```
+
+Checking the solution again", result shows that in fact the model is 100% accurate. 
+
+### Random Forest model (3rd)
+
+Let's try to use only the 27 most important variable (over 52 in the 2nd FR model) and see what we can do with it :
+
+```{r}
+cols <- rownames( importance2$importance)[ 1:27]
+
+optimtrain <- training[ , c( cols, "classe")]
+optimtest  <- testing[  , c( cols, "problem_id")]
+
+inTrain <- createDataPartition( optimtrain$classe, p = .8)[[ 1]]
+optimtrain <- optimtrain[  inTrain, ]
+optimvalid <- optimtrain[ -inTrain, ]
+optimtest  <- optimtest
+```
+
+
+```{r}
+if( file.exists( FILEmodelRF3)){
+  load( FILEmodelRF3) 
+} else {  
+  stimeRF3 <- system.time(
+    modelRF3 <- train( classe ~ ., 
+                       method = "rf",  
+                       data = optimtrain, 
+                       trControl = trC))
+  save( stimeRF3, file = FILEstimeRF3)
+  save( modelRF3, file = FILEmodelRF3)}
+
+modelRF3
+confusionMatrix( modelRF3) 
+importance3 <- varImp( modelRF3, scale = FALSE)
+```
+
+Below are the different set of variables used by the last two RF models :
+
+```{r, fig.cap="Fig.4 : Rank of features by importance - comparison between the two RF models : 52 features (left) and 27 features (right).", fig.height=9}
+p1 <- plot( varImp( modelRF2))
+p2 <- plot( varImp( modelRF3))
+grid.arrange( p1, p2, nrow = 1, ncol = 2)
+```
+
+### Random Forest Prediction (3rd)
+
+```{r}
+predRF3 <- predict( modelRF3, optimvalid)
+AccRF3  <- postResample( predRF3, optimvalid$classe)
+```
+
+We cn see below that the accuracy of this model is still excellent even with less features :
+
+```{r}
+AccRF3[ 1]
+```
+
+Let's check if the optimum number of feature is still 27 : 
+
+```{r, fig.cap="Fig.5 : Optimum number of features."}
+plot( modelRF3)
+```
+
+The description of the model above shows us that there is better accuracy of the model with 14 features, and even with 2 well chosen features we could have a really good accuracy !  
+
+### Testing the best model again again
+
+The accuracy of this last model is `r round( AccRF3[ 1], 2)`. And the prediction of the classes of the sample test is the same than with the previous model (with 52 features). 
+
+```{r}
+optimtest$result <- predict( modelRF3, optimtest) 
+optimtest$result
+modelRF3
+```
+
+Is it worth it to lower the number of variables in a RF model (at least in our example) ? Let's try to answer it by looking at the computation time and the size of the model for both. 
+
+Computations have been done using parallel settings, on a ASUS UX305LA laptop with 8GB RAM and a i7-5500U CPU.
+
+```{r, include=FALSE}
+if ( ! exists( "stimeRF2")) load( FILEstimeRF2)
+if ( ! exists( "modelRF2")) load( FILEmodelRF2)
+st2 <- paste( round( stimeRF2[ 3] / 60), "min for the first model")
+os2 <- round( object.size( modelRF2) * 10^-6)
+
+if ( ! exists( "stimeRF3")) load( FILEstimeRF3)
+if ( ! exists( "modelRF3")) load( FILEmodelRF3)
+st3 <- paste( round( stimeRF3[ 3] / 60), "min for the second model") 
+os3 <- round( object.size( modelRF3) * 10^-6)
+```
+
+
+```{r}
+paste( "52 Feat. Computation Time :", stimeRF2[ 3]) 
+paste( "52 Feat. RAM Object Size", object.size( modelRF2))
+paste( "52 Feat. HD File Size", file.size( "modelRF2.rda"))  
+
+paste( "10 Feat. Computation Time :", stimeRF3[ 3]) 
+paste( "10 Feat. RAM Object Size", object.size( modelRF3))
+paste( "10 Feat. HD File Size", file.size( "modelRF3.rda"))  
+```
+
+As we can see reducing the number of variables reduce the computation time to `r st2` versus `r st3`, but increase the size of the model in RAM (`r os2` Mb for the first one versus `r os3` Mb for the second one) and on HD. Further analysis should be conducted to see how the same model with only the 2 best features could be improve and, if training parameter tuning can also improve these numbers.
+
+# Conclusion 
+
+The best model we have tried is the Random Forest. It has accuracy of 100% on the validation set and 100% result on the test set. The choice and the quantity of features is of lot of importance in the accuracy of the model, and computation time and size of models in the training process. Thus we suggest first to use all the features available, and then if needed, to subset the features with the help of the variable importance given by the first model. Also, in a further improvement a check for outliers, and a parameter tuning of the model may be of some improvement. 
+
+```{r}
+stopCluster( cluster)
+```
+
+```{r, include=FALSE}
+sessionInfo()
+```
+
+
+
+
+
